@@ -17,6 +17,8 @@ limitations under the License.
 package kubelet
 
 import (
+	"fmt"
+
 	"github.com/google/cadvisor/events"
 	cadvisorapi "github.com/google/cadvisor/info/v1"
 	"k8s.io/api/core/v1"
@@ -51,7 +53,7 @@ const systemOOMEvent = "SystemOOM"
 func (ow *realOOMWatcher) Start(ref *v1.ObjectReference) error {
 	request := events.Request{
 		EventType: map[cadvisorapi.EventType]bool{
-			cadvisorapi.EventOom: true,
+			cadvisorapi.EventOomKill: true,
 		},
 		ContainerName:        "/",
 		IncludeSubcontainers: false,
@@ -66,7 +68,11 @@ func (ow *realOOMWatcher) Start(ref *v1.ObjectReference) error {
 
 		for event := range eventChannel.GetChannel() {
 			klog.V(2).Infof("Got sys oom event from cadvisor: %v", event)
-			ow.recorder.PastEventf(ref, metav1.Time{Time: event.Timestamp}, v1.EventTypeWarning, systemOOMEvent, "System OOM encountered")
+			eventMsg := "System OOM encountered"
+			if event.EventData.OomKill.Pid != 0 && event.EventData.OomKill.ProcessName != "" {
+				eventMsg = fmt.Sprintf("%s:  process pid %d, process name: %s", eventMsg, event.EventData.OomKill.Pid, event.EventData.OomKill.ProcessName)
+			}
+			ow.recorder.PastEventf(ref, metav1.Time{Time: event.Timestamp}, v1.EventTypeWarning, systemOOMEvent, eventMsg)
 		}
 		klog.Errorf("Unexpectedly stopped receiving OOM notifications from cAdvisor")
 	}()

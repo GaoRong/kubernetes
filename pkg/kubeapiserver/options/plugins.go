@@ -26,6 +26,7 @@ import (
 	"k8s.io/kubernetes/plugin/pkg/admission/antiaffinity"
 	"k8s.io/kubernetes/plugin/pkg/admission/defaulttolerationseconds"
 	"k8s.io/kubernetes/plugin/pkg/admission/deny"
+	"k8s.io/kubernetes/plugin/pkg/admission/disableservicelinks"
 	"k8s.io/kubernetes/plugin/pkg/admission/eventratelimit"
 	"k8s.io/kubernetes/plugin/pkg/admission/exec"
 	"k8s.io/kubernetes/plugin/pkg/admission/extendedresourcetoleration"
@@ -78,6 +79,7 @@ var AllOrderedPlugins = []string{
 	podnodeselector.PluginName,              // PodNodeSelector
 	podpriority.PluginName,                  // Priority
 	defaulttolerationseconds.PluginName,     // DefaultTolerationSeconds
+	disableservicelinks.PluginName,          // DisableServiceLinks
 	podtolerationrestriction.PluginName,     // PodTolerationRestriction
 	exec.DenyEscalatingExec,                 // DenyEscalatingExec
 	exec.DenyExecOnPrivileged,               // DenyExecOnPrivileged
@@ -126,6 +128,7 @@ func RegisterAllAdmissionPlugins(plugins *admission.Plugins) {
 	setdefault.Register(plugins)
 	resize.Register(plugins)
 	storageobjectinuseprotection.Register(plugins)
+	disableservicelinks.Register(plugins)
 }
 
 // DefaultOffAdmissionPlugins get admission plugins off by default for kube-apiserver.
@@ -137,6 +140,7 @@ func DefaultOffAdmissionPlugins() sets.String {
 		setdefault.PluginName,                   //DefaultStorageClass
 		resize.PluginName,                       //PersistentVolumeClaimResize
 		defaulttolerationseconds.PluginName,     //DefaultTolerationSeconds
+		disableservicelinks.PluginName,          //DisableServiceLinks
 		mutatingwebhook.PluginName,              //MutatingAdmissionWebhook
 		validatingwebhook.PluginName,            //ValidatingAdmissionWebhook
 		resourcequota.PluginName,                //ResourceQuota

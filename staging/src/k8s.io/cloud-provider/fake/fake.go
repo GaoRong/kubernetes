@@ -24,7 +24,8 @@ import (
 	"sync"
 	"time"
 
-	"k8s.io/api/core/v1"
+	"github.com/stretchr/testify/mock"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	cloudprovider "k8s.io/cloud-provider"
 )
@@ -56,6 +57,8 @@ var _ cloudprovider.Clusters = (*Cloud)(nil)
 
 // Cloud is a test-double implementation of Interface, LoadBalancer, Instances, and Routes. It is useful for testing.
 type Cloud struct {
+	mock.Mock
+
 	Exists bool
 	Err    error
 
@@ -178,6 +181,7 @@ func (f *Cloud) GetLoadBalancerName(ctx context.Context, clusterName string, ser
 // EnsureLoadBalancer is a test-spy implementation of LoadBalancer.EnsureLoadBalancer.
 // It adds an entry "create" into the internal method call record.
 func (f *Cloud) EnsureLoadBalancer(ctx context.Context, clusterName string, service *v1.Service, nodes []*v1.Node) (*v1.LoadBalancerStatus, error) {
+
 	f.addCall("create")
 	if f.Balancers == nil {
 		f.Balancers = make(map[string]Balancer)
@@ -194,10 +198,8 @@ func (f *Cloud) EnsureLoadBalancer(ctx context.Context, clusterName string, serv
 
 	f.Balancers[name] = Balancer{name, region, spec.LoadBalancerIP, spec.Ports, nodes}
 
-	status := &v1.LoadBalancerStatus{}
-	status.Ingress = []v1.LoadBalancerIngress{{IP: f.ExternalIP.String()}}
-
-	return status, f.Err
+	args := f.Called(ctx, clusterName, service, nodes)
+	return args.Get(0).(*v1.LoadBalancerStatus), args.Error(1)
 }
 
 // UpdateLoadBalancer is a test-spy implementation of LoadBalancer.UpdateLoadBalancer.
@@ -212,7 +214,8 @@ func (f *Cloud) UpdateLoadBalancer(ctx context.Context, clusterName string, serv
 // It adds an entry "delete" into the internal method call record.
 func (f *Cloud) EnsureLoadBalancerDeleted(ctx context.Context, clusterName string, service *v1.Service) error {
 	f.addCall("delete")
-	return f.Err
+	args := f.Called(ctx, clusterName, service)
+	return args.Error(0)
 }
 
 // AddSSHKeyToAllInstances adds an SSH public key as a legal identity for all instances

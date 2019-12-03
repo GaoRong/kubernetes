@@ -26,6 +26,7 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -307,7 +308,6 @@ func (s *Controller) syncLoadBalancerIfNeeded(service *v1.Service, key string) (
 	previousStatus := service.Status.LoadBalancer.DeepCopy()
 	var newStatus *v1.LoadBalancerStatus
 	var op loadBalancerOperation
-	var err error
 
 	if !wantsLoadBalancer(service) || needsCleanup(service) {
 		// Delete the load balancer if service no longer wants one, or if service needs cleanup.
@@ -337,7 +337,8 @@ func (s *Controller) syncLoadBalancerIfNeeded(service *v1.Service, key string) (
 		s.eventRecorder.Event(service, v1.EventTypeNormal, "EnsuringLoadBalancer", "Ensuring load balancer")
 		// Always add a finalizer prior to creating load balancers, this ensures Services
 		// can't be deleted until all corresponding load balancer resources are also deleted.
-		if err := s.addFinalizer(service); err != nil {
+		newsvc, err := s.addFinalizer(service)
+		if err != nil {
 			return op, fmt.Errorf("failed to add load balancer cleanup finalizer: %v", err)
 		}
 		newStatus, err = s.ensureLoadBalancer(service)
@@ -349,7 +350,18 @@ func (s *Controller) syncLoadBalancerIfNeeded(service *v1.Service, key string) (
 				klog.V(4).Infof("LoadBalancer for service %s implemented by a different controller %s, Ignoring error", key, s.cloud.ProviderName())
 				return op, nil
 			}
-			return op, fmt.Errorf("failed to ensure load balancer: %v", err)
+
+			errList := []error{fmt.Errorf("failed to ensure load balancer: %v", err)}
+			// Ensure load balancer resources are cleaned up after creation failed
+			if err := s.balancer.EnsureLoadBalancerDeleted(context.TODO(), s.clusterName, service); err == nil {
+				if err := s.removeFinalizer(newsvc); err != nil {
+					errList = append(errList, fmt.Errorf("failed to remove load balancer cleanup finalizer after creation failed: %v", err))
+				}
+			} else {
+				errList = append(errList, fmt.Errorf("failed to clean up load balancer after creation failed: %v", err))
+			}
+
+			return op, utilerrors.NewAggregate(errList)
 		}
 		if newStatus == nil {
 			return op, fmt.Errorf("service status returned by EnsureLoadBalancer is nil")
@@ -793,9 +805,9 @@ func (s *Controller) processLoadBalancerDelete(service *v1.Service, key string) 
 }
 
 // addFinalizer patches the service to add finalizer.
-func (s *Controller) addFinalizer(service *v1.Service) error {
+func (s *Controller) addFinalizer(service *v1.Service) (*v1.Service, error) {
 	if servicehelper.HasLBFinalizer(service) {
-		return nil
+		return service, nil
 	}
 
 	// Make a copy so we don't mutate the shared informer cache.
@@ -803,8 +815,8 @@ func (s *Controller) addFinalizer(service *v1.Service) error {
 	updated.ObjectMeta.Finalizers = append(updated.ObjectMeta.Finalizers, servicehelper.LoadBalancerCleanupFinalizer)
 
 	klog.V(2).Infof("Adding finalizer to service %s/%s", updated.Namespace, updated.Name)
-	_, err := patch(s.kubeClient.CoreV1(), service, updated)
-	return err
+	newSvc, err := patch(s.kubeClient.CoreV1(), service, updated)
+	return newSvc, err
 }
 
 // removeFinalizer patches the service to remove finalizer.

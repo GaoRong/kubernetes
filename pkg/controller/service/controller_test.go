@@ -44,7 +44,10 @@ import (
 	"k8s.io/kubernetes/pkg/controller"
 )
 
-const region = "us-central"
+const (
+	region  = "us-central"
+	cluster = "test-cluster"
+)
 
 func newService(name string, uid types.UID, serviceType v1.ServiceType) *v1.Service {
 	return &v1.Service{
@@ -77,7 +80,7 @@ func newController() (*Controller, *fakecloud.Cloud, *fake.Clientset) {
 	serviceInformer := informerFactory.Core().V1().Services()
 	nodeInformer := informerFactory.Core().V1().Nodes()
 
-	controller, _ := New(cloud, client, serviceInformer, nodeInformer, "test-cluster")
+	controller, _ := New(cloud, client, serviceInformer, nodeInformer, cluster)
 	controller.nodeListerSynced = alwaysReady
 	controller.serviceListerSynced = alwaysReady
 	controller.eventRecorder = record.NewFakeRecorder(100)
@@ -91,6 +94,8 @@ func newController() (*Controller, *fakecloud.Cloud, *fake.Clientset) {
 // TODO(@MrHohn): Verify the end state when below issue is resolved:
 // https://github.com/kubernetes/client-go/issues/607
 func TestSyncLoadBalancerIfNeeded(t *testing.T) {
+	var nodes []*v1.Node
+
 	testCases := []struct {
 		desc                 string
 		service              *v1.Service
@@ -308,6 +313,13 @@ func TestSyncLoadBalancerIfNeeded(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.desc, func(t *testing.T) {
 			controller, cloud, client := newController()
+
+			loadbalancerStatus := v1.LoadBalancerStatus{
+				Ingress: []v1.LoadBalancerIngress{{IP: cloud.ExternalIP.String()}},
+			}
+			cloud.On("EnsureLoadBalancer", context.TODO(), cluster, tc.service, nodes).Return(&loadbalancerStatus, nil)
+			cloud.On("EnsureLoadBalancerDeleted", context.TODO(), cluster, tc.service).Return(nil)
+
 			cloud.Exists = tc.lbExists
 			key := fmt.Sprintf("%s/%s", tc.service.Namespace, tc.service.Name)
 			if _, err := client.CoreV1().Services(tc.service.Namespace).Create(tc.service); err != nil {
@@ -391,6 +403,76 @@ func TestSyncLoadBalancerIfNeeded(t *testing.T) {
 			}
 			if numPatches != expectNumPatches {
 				t.Errorf("Got %d patches, expect %d instead. Actions: %v", numPatches, expectNumPatches, actions)
+			}
+		})
+	}
+}
+
+func TestCleanupLoadBalancerAfterCreationFailed(t *testing.T) {
+	svc := newService("s0", "444", v1.ServiceTypeLoadBalancer)
+	var nodes []*v1.Node
+
+	creationErr := errors.New("permission deny")
+	deletionErr := errors.New("do not exist")
+
+	testCases := []struct {
+		desc                         string
+		ensureLoadbalancerErr        error
+		ensureLoadbalancerDeletedErr error
+		expectErr                    error
+		expectFinalizer              bool
+	}{
+		{
+			desc:                         "everything is ok",
+			ensureLoadbalancerErr:        nil,
+			ensureLoadbalancerDeletedErr: nil,
+			expectErr:                    nil,
+			expectFinalizer:              true,
+		},
+		{
+			desc:                         "ensure failed",
+			ensureLoadbalancerErr:        creationErr,
+			ensureLoadbalancerDeletedErr: nil,
+			expectErr:                    fmt.Errorf("failed to ensure load balancer: %v", creationErr),
+			expectFinalizer:              false,
+		},
+		{
+			desc:                         "ensure and ensureDelete failed",
+			ensureLoadbalancerErr:        creationErr,
+			ensureLoadbalancerDeletedErr: deletionErr,
+			expectErr:                    fmt.Errorf("[failed to ensure load balancer: %v, failed to clean up load balancer after creation failed: %v]", creationErr, deletionErr),
+			expectFinalizer:              true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.desc, func(t *testing.T) {
+			controller, cloudMock, client := newController()
+
+			if _, err := client.CoreV1().Services(svc.Namespace).Create(svc); err != nil {
+				t.Fatalf("Failed to prepare service for testing: %v", err)
+			}
+
+			loadbalancerStatus := v1.LoadBalancerStatus{
+				Ingress: []v1.LoadBalancerIngress{{IP: cloudMock.ExternalIP.String()}},
+			}
+
+			cloudMock.On("EnsureLoadBalancer", context.Background(), cluster, svc, nodes).Return(&loadbalancerStatus, tc.ensureLoadbalancerErr)
+			cloudMock.On("EnsureLoadBalancerDeleted", context.Background(), cluster, svc).Return(tc.ensureLoadbalancerDeletedErr)
+
+			_, err := controller.syncLoadBalancerIfNeeded(svc, "")
+			if err != tc.expectErr && err.Error() != tc.expectErr.Error() {
+				t.Errorf("expected err mismatch, expected %+v, got %+v", tc.expectErr, err)
+			}
+
+			// make sure the service finalizer is cleanedup as expected
+			svc, err := client.CoreV1().Services(svc.Namespace).Get(svc.Name, metav1.GetOptions{})
+			if err != nil {
+				t.Errorf("failed to get svc: %v", svc.Name)
+			}
+			hasFinalizer := len(svc.GetFinalizers()) != 0
+			if tc.expectFinalizer != hasFinalizer {
+				t.Errorf("failed to remove finalizer for svc: %v", svc.Name)
 			}
 		})
 	}
@@ -526,7 +608,7 @@ func TestGetNodeConditionPredicate(t *testing.T) {
 }
 
 func TestProcessServiceCreateOrUpdate(t *testing.T) {
-	controller, _, client := newController()
+	controller, cloudMock, client := newController()
 
 	//A pair of old and new loadbalancer IP address
 	oldLBIP := "192.168.1.1"
@@ -606,6 +688,13 @@ func TestProcessServiceCreateOrUpdate(t *testing.T) {
 		if _, err := client.CoreV1().Services(tc.svc.Namespace).Create(tc.svc); err != nil {
 			t.Fatalf("Failed to prepare service %s for testing: %v", tc.key, err)
 		}
+
+		var nodes []*v1.Node
+		loadbalancerStatus := v1.LoadBalancerStatus{
+			Ingress: []v1.LoadBalancerIngress{{IP: cloudMock.ExternalIP.String()}},
+		}
+		cloudMock.On("EnsureLoadBalancer", context.Background(), cluster, newSvc, nodes).Return(&loadbalancerStatus, nil)
+
 		obtErr := controller.processServiceCreateOrUpdate(newSvc, tc.key)
 		if err := tc.expectedFn(newSvc, obtErr); err != nil {
 			t.Errorf("%v processServiceCreateOrUpdate() %v", tc.testName, err)
@@ -643,10 +732,16 @@ func TestProcessServiceCreateOrUpdateK8sError(t *testing.T) {
 			svc := newService(svcName, types.UID("123"), v1.ServiceTypeLoadBalancer)
 			// Preset finalizer so k8s error only happens when patching status.
 			svc.Finalizers = []string{servicehelper.LoadBalancerCleanupFinalizer}
-			controller, _, client := newController()
+			controller, cloudMock, client := newController()
 			client.PrependReactor("patch", "services", func(action core.Action) (bool, runtime.Object, error) {
 				return true, nil, tc.k8sErr
 			})
+
+			var nodes []*v1.Node
+			loadbalancerStatus := v1.LoadBalancerStatus{
+				Ingress: []v1.LoadBalancerIngress{{IP: cloudMock.ExternalIP.String()}},
+			}
+			cloudMock.On("EnsureLoadBalancer", context.Background(), cluster, svc, nodes).Return(&loadbalancerStatus, nil)
 
 			if err := controller.processServiceCreateOrUpdate(svc, svcName); !reflect.DeepEqual(err, tc.expectErr) {
 				t.Fatalf("processServiceCreateOrUpdate() = %v, want %v", err, tc.expectErr)
@@ -676,6 +771,7 @@ func TestProcessServiceCreateOrUpdateK8sError(t *testing.T) {
 func TestSyncService(t *testing.T) {
 
 	var controller *Controller
+	// var cloudMock *
 
 	testCases := []struct {
 		testName   string
@@ -687,7 +783,7 @@ func TestSyncService(t *testing.T) {
 			testName: "if an invalid service name is synced",
 			key:      "invalid/key/string",
 			updateFn: func() {
-				controller, _, _ = newController()
+				controller, cloudMock, _ = newController()
 			},
 			expectedFn: func(e error) error {
 				//TODO: should find a way to test for dependent package errors in such a way that it won't break
@@ -737,6 +833,12 @@ func TestSyncService(t *testing.T) {
 	for _, tc := range testCases {
 
 		tc.updateFn()
+
+		var nodes []*v1.Node
+		loadbalancerStatus := v1.LoadBalancerStatus{
+			Ingress: []v1.LoadBalancerIngress{{IP: cloudMock.ExternalIP.String()}},
+		}
+		cloudMock.On("EnsureLoadBalancer", context.Background(), cluster, svc, nodes).Return(&loadbalancerStatus, nil)
 		obtainedErr := controller.syncService(tc.key)
 
 		//expected matches obtained ??.
@@ -1225,7 +1327,7 @@ func TestAddFinalizer(t *testing.T) {
 			if _, err := s.kubeClient.CoreV1().Services(tc.svc.Namespace).Create(tc.svc); err != nil {
 				t.Fatalf("Failed to prepare service for testing: %v", err)
 			}
-			if err := s.addFinalizer(tc.svc); err != nil {
+			if _, err := s.addFinalizer(tc.svc); err != nil {
 				t.Fatalf("addFinalizer() = %v, want nil", err)
 			}
 			patchActionFound := false
